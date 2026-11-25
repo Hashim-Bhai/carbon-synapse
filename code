@@ -1,0 +1,825 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Pin Definitions
+const int PIN_POT_WATTS  = 35;
+const int PIN_FAULT_SW   = 34;
+const int PIN_BTN_OVERR  = 32;
+const int PIN_BTN_RESET  = 33;
+const int PIN_RELAY_SHED = 27;
+const int PIN_I2C_SDA    = 21;
+const int PIN_I2C_SCL    = 22;
+
+// Active-LOW Relay Logic
+#define RELAY_NC_LED_ON  HIGH
+#define RELAY_NC_LED_OFF LOW
+
+// 16x2 I2C LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Neural Network: 4 -> 12 -> 8 -> 3
+float w1[12][4], b1[12];
+float w2[8][12], b2[8];
+float w3[3][8], b3[3];
+
+float z1[12], a1[12];
+float z2[8], a2[8];
+float z3[3], y_hat[3] = {0.85f, 0.75f, 0.77f};
+float y_prev[3] = {0.85f, 0.75f, 0.77f};
+
+// Channel shares and utility weights
+const float ch_share[3] = {0.20f, 0.45f, 0.35f};
+float utility_w[3] = {1.50f, 0.55f, 0.70f};
+
+// 24-hour grid carbon intensity profile
+const float grid_24h[24] = {
+    260, 245, 235, 225, 220, 230,
+    210, 180, 145, 115, 95, 90,
+    95, 110, 140, 185, 240, 310,
+    390, 440, 430, 395, 340, 290
+};
+
+// Carbon budget
+float carbon_budget_max = 40.0f;
+const unsigned long BUDGET_RESET_MS = 12000UL;
+unsigned long last_budget_reset = 0;
+
+// Wi-Fi and MQTT configuration
+const char* WIFI_SSID = "POCO X7";
+const char* WIFI_PASSWORD = "youareanidiot";
+const char* MQTT_HOST = "broker.emqx.io";
+const uint16_t MQTT_PORT = 1883;
+
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+
+char mqttStatusTopic[80];
+char mqttCommandTopic[80];
+
+unsigned long lastMqttReconnect = 0;
+unsigned long lastMqttPublish = 0;
+
+float lastWeightDelta = 0.0f;
+
+// Simulation variables
+float cum_co2 = 0.0f;
+float saved_co2 = 0.0f;
+float lambda = 0.30f;
+int sim_tick = 0;
+
+bool relay_nes_on = true;
+bool serial_fault_force = false;
+
+// Activation functions
+inline float leaky_relu(float x) {
+    return x > 0.0f ? x : 0.05f * x;
+}
+
+inline float leaky_relu_d(float x) {
+    return x > 0.0f ? 1.0f : 0.05f;
+}
+
+inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-constrain(x, -10.0f, 10.0f)));
+}
+
+// Receive carbon budget from Python GUI
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+
+    if (strcmp(topic, mqttCommandTopic) != 0 ||
+        length == 0 || length >= 32) {
+        return;
+    }
+
+    char command[32];
+
+    memcpy(command, payload, length);
+    command[length] = '\0';
+
+    char* endPtr = nullptr;
+    float requestedBudget = strtof(command, &endPtr);
+
+    if (endPtr == command ||
+        *endPtr != '\0' ||
+        !isfinite(requestedBudget) ||
+        requestedBudget < 1.0f ||
+        requestedBudget > 10000.0f) {
+
+        Serial.println("MQTT: Invalid carbon budget rejected");
+        return;
+    }
+
+    carbon_budget_max = requestedBudget;
+
+    Serial.print("MQTT: Carbon budget updated to ");
+    Serial.println(carbon_budget_max, 2);
+}
+
+// Connect to Wi-Fi
+void connectWiFi() {
+
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.print("Connecting to Wi-Fi");
+
+    unsigned long started = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - started < 15000UL) {
+
+        delay(300);
+        Serial.print(".");
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Wi-Fi connected. IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("Wi-Fi connection pending. Retrying...");
+    }
+}
+
+// Connect to MQTT broker
+void reconnectMQTT() {
+
+    if (WiFi.status() != WL_CONNECTED) {
+        connectWiFi();
+        return;
+    }
+
+    if (mqtt.connected()) {
+        return;
+    }
+
+    if (millis() - lastMqttReconnect < 3000UL) {
+        return;
+    }
+
+    lastMqttReconnect = millis();
+
+    String clientId = "CarbonGrid-" +
+        String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX);
+
+    if (mqtt.connect(clientId.c_str())) {
+
+        mqtt.subscribe(mqttCommandTopic);
+
+        Serial.println("MQTT connected!");
+
+        Serial.print("Status topic: ");
+        Serial.println(mqttStatusTopic);
+
+        Serial.print("Command topic: ");
+        Serial.println(mqttCommandTopic);
+
+    } else {
+
+        Serial.print("MQTT connection failed. State: ");
+        Serial.println(mqtt.state());
+    }
+}
+
+// Publish ESP32 data to MQTT
+void publishMqttStatus(
+    float actualWatts,
+    float gridIntensity,
+    int faultFlag,
+    bool overridePressed
+) {
+
+    if (!mqtt.connected()) {
+        return;
+    }
+
+    char payload[512];
+
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"co2_usage\":%.4f,"
+        "\"saved_co2\":%.4f,"
+        "\"carbon_budget\":%.2f,"
+        "\"lambda\":%.4f,"
+        "\"weight_delta\":%.6f,"
+        "\"actual_watts\":%.2f,"
+        "\"grid_intensity\":%.2f,"
+        "\"critical_relay\":1,"
+        "\"sheddable_relay\":%d,"
+        "\"fault\":%d,"
+        "\"override\":%d,"
+        "\"y1\":%.4f,"
+        "\"y2\":%.4f,"
+        "\"y3\":%.4f,"
+        "\"simulation_tick\":%d"
+        "}",
+
+        cum_co2,
+        saved_co2,
+        carbon_budget_max,
+        lambda,
+        lastWeightDelta,
+        actualWatts,
+        gridIntensity,
+        relay_nes_on ? 1 : 0,
+        faultFlag,
+        overridePressed ? 1 : 0,
+        y_hat[0],
+        y_hat[1],
+        y_hat[2],
+        sim_tick
+    );
+
+    mqtt.publish(mqttStatusTopic, payload);
+}
+
+// Initialize neural network
+void init_network() {
+
+    randomSeed(42);
+
+    for (int i = 0; i < 12; i++) {
+
+        b1[i] = 0.0f;
+
+        for (int j = 0; j < 4; j++) {
+            w1[i][j] =
+                ((random(2000) / 1000.0f) - 1.0f) * 0.20f;
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+
+        b2[i] = 0.0f;
+
+        for (int j = 0; j < 12; j++) {
+            w2[i][j] =
+                ((random(2000) / 1000.0f) - 1.0f) * 0.20f;
+        }
+    }
+
+    b3[0] = 1.65f;
+    b3[1] = 1.05f;
+    b3[2] = 1.20f;
+
+    for (int i = 0; i < 3; i++) {
+
+        for (int j = 0; j < 8; j++) {
+            w3[i][j] =
+                ((random(2000) / 1000.0f) - 1.0f) * 0.15f;
+        }
+    }
+}
+
+// Check for numerical corruption
+bool network_has_nan() {
+
+    if (isnan(cum_co2) || isinf(cum_co2) ||
+        isnan(lambda) || isinf(lambda)) {
+        return true;
+    }
+
+    for (int i = 0; i < 3; i++) {
+
+        if (isnan(y_hat[i]) || isinf(y_hat[i]) ||
+            isnan(b3[i])) {
+            return true;
+        }
+
+        for (int j = 0; j < 8; j++) {
+
+            if (isnan(w3[i][j]) || isinf(w3[i][j])) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// Neural network forward propagation
+void forward(const float x[4]) {
+
+    for (int i = 0; i < 12; i++) {
+
+        float s = b1[i];
+
+        for (int j = 0; j < 4; j++) {
+            s += w1[i][j] * x[j];
+        }
+
+        z1[i] = constrain(s, -10.0f, 10.0f);
+        a1[i] = leaky_relu(z1[i]);
+    }
+
+    for (int i = 0; i < 8; i++) {
+
+        float s = b2[i];
+
+        for (int j = 0; j < 12; j++) {
+            s += w2[i][j] * a1[j];
+        }
+
+        z2[i] = constrain(s, -10.0f, 10.0f);
+        a2[i] = leaky_relu(z2[i]);
+    }
+
+    for (int i = 0; i < 3; i++) {
+
+        float s = b3[i];
+
+        for (int j = 0; j < 8; j++) {
+            s += w3[i][j] * a2[j];
+        }
+
+        z3[i] = constrain(s, -10.0f, 10.0f);
+        y_hat[i] = sigmoid(z3[i]);
+    }
+}
+
+// Lagrangian backpropagation
+float lagrangian_backprop(
+    const float x[4],
+    float watts_norm,
+    float grid_norm,
+    bool override_pressed,
+    float lr
+) {
+
+    forward(x);
+
+    float w_delta_sum = 0.0f;
+    float dz3[3];
+    float da2[8] = {0};
+
+    float load_carbon_factor =
+        (0.35f + 0.65f * grid_norm) *
+        (watts_norm * watts_norm);
+
+    for (int i = 0; i < 3; i++) {
+
+        float penalty =
+            lambda * ch_share[i] *
+            load_carbon_factor * 5.2f;
+
+        if (i == 1 && override_pressed) {
+            penalty += 0.90f;
+        }
+
+        float dL_dy =
+            -(utility_w[i] / (y_hat[i] + 0.05f))
+            + penalty
+            + 0.15f * (y_hat[i] - y_prev[i]);
+
+        dL_dy = constrain(dL_dy, -2.0f, 2.0f);
+
+        float sig_d =
+            fmaxf(y_hat[i] * (1.0f - y_hat[i]), 0.10f);
+
+        dz3[i] = constrain(dL_dy * sig_d, -0.8f, 0.8f);
+
+        if (i == 0) {
+            b3[i] = constrain(
+                b3[i] - lr * dz3[i], 0.90f, 2.20f
+            );
+        } else if (i == 1) {
+            b3[i] = constrain(
+                b3[i] - lr * dz3[i], -0.65f, 1.80f
+            );
+        } else {
+            b3[i] = constrain(
+                b3[i] - lr * dz3[i], -1.00f, 2.00f
+            );
+        }
+
+        for (int j = 0; j < 8; j++) {
+
+            da2[j] += w3[i][j] * dz3[i];
+
+            float dw = lr * dz3[i] * a2[j];
+
+            w3[i][j] = constrain(
+                w3[i][j] - dw, -1.0f, 1.0f
+            );
+
+            w_delta_sum += fabsf(dw);
+        }
+    }
+
+    float dz2[8], da1[12] = {0};
+
+    for (int j = 0; j < 8; j++) {
+
+        dz2[j] = constrain(
+            da2[j] * leaky_relu_d(z2[j]),
+            -0.8f, 0.8f
+        );
+
+        b2[j] = constrain(
+            b2[j] - lr * dz2[j], -1.5f, 1.5f
+        );
+
+        for (int k = 0; k < 12; k++) {
+
+            da1[k] += w2[j][k] * dz2[j];
+
+            float dw = lr * dz2[j] * a1[k];
+
+            w2[j][k] = constrain(
+                w2[j][k] - dw, -1.5f, 1.5f
+            );
+
+            w_delta_sum += fabsf(dw);
+        }
+    }
+
+    for (int k = 0; k < 12; k++) {
+
+        float dz1 = constrain(
+            da1[k] * leaky_relu_d(z1[k]),
+            -0.8f, 0.8f
+        );
+
+        b1[k] = constrain(
+            b1[k] - lr * dz1, -1.5f, 1.5f
+        );
+
+        for (int m = 0; m < 4; m++) {
+
+            float dw = lr * dz1 * x[m];
+
+            w1[k][m] = constrain(
+                w1[k][m] - dw, -1.5f, 1.5f
+            );
+
+            w_delta_sum += fabsf(dw);
+        }
+    }
+
+    return w_delta_sum;
+}
+
+// Update LCD
+void update_lcd(int ood_flag) {
+
+    char raw0[17];
+    char raw1[17];
+    char line0[17];
+    char line1[17];
+
+    snprintf(
+        raw0, sizeof(raw0),
+        "E:%.1fg S:%.1fg",
+        cum_co2, saved_co2
+    );
+
+    snprintf(
+        raw1, sizeof(raw1),
+        "FLT:%s NES:%s",
+        ood_flag ? "ON" : "OFF",
+        relay_nes_on ? "ON" : "OFF"
+    );
+
+    snprintf(line0, sizeof(line0), "%-16s", raw0);
+    snprintf(line1, sizeof(line1), "%-16s", raw1);
+
+    lcd.setCursor(0, 0);
+    lcd.print(line0);
+
+    lcd.setCursor(0, 1);
+    lcd.print(line1);
+}
+
+// Setup
+void setup() {
+
+    Serial.begin(115200);
+
+    uint32_t deviceId =
+        (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
+
+    snprintf(
+        mqttStatusTopic,
+        sizeof(mqttStatusTopic),
+        "carbon-grid/%08X/status",
+        deviceId
+    );
+
+    snprintf(
+        mqttCommandTopic,
+        sizeof(mqttCommandTopic),
+        "carbon-grid/%08X/command",
+        deviceId
+    );
+
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setCallback(mqttCallback);
+    mqtt.setBufferSize(512);
+
+    connectWiFi();
+
+    pinMode(PIN_FAULT_SW, INPUT);
+    pinMode(PIN_BTN_OVERR, INPUT_PULLUP);
+    pinMode(PIN_BTN_RESET, INPUT_PULLUP);
+    pinMode(PIN_RELAY_SHED, OUTPUT);
+
+    digitalWrite(PIN_RELAY_SHED, RELAY_NC_LED_ON);
+
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+
+    init_network();
+
+    last_budget_reset = millis();
+
+    update_lcd(0);
+}
+
+// Main loop
+void loop() {
+
+    static unsigned long last_tick = 0;
+
+    unsigned long now = millis();
+
+    reconnectMQTT();
+
+    if (mqtt.connected()) {
+        mqtt.loop();
+    }
+
+    if (now - last_tick < 250) {
+        return;
+    }
+
+    last_tick = now;
+
+    // Serial fault control
+    while (Serial.available() > 0) {
+
+        char c = Serial.read();
+
+        if (c == 'f') {
+            serial_fault_force = true;
+        }
+
+        if (c == 'n') {
+            serial_fault_force = false;
+        }
+    }
+
+    // Self-healing guard
+    if (network_has_nan()) {
+
+        cum_co2 = 0.0f;
+        saved_co2 = 0.0f;
+        lambda = 0.30f;
+
+        init_network();
+    }
+
+    // Full reset button
+    if (digitalRead(PIN_BTN_RESET) == LOW) {
+
+        cum_co2 = 0.0f;
+        saved_co2 = 0.0f;
+        lambda = 0.30f;
+        sim_tick = 0;
+
+        last_budget_reset = now;
+
+        serial_fault_force = false;
+        relay_nes_on = true;
+
+        digitalWrite(PIN_RELAY_SHED, RELAY_NC_LED_ON);
+
+        y_hat[0] = 0.85f;
+        y_hat[1] = 0.75f;
+        y_hat[2] = 0.77f;
+
+        y_prev[0] = 0.85f;
+        y_prev[1] = 0.75f;
+        y_prev[2] = 0.77f;
+
+        utility_w[0] = 1.50f;
+        utility_w[1] = 0.55f;
+        utility_w[2] = 0.70f;
+
+        init_network();
+    }
+
+    // Automatic 12-second carbon budget cycle reset
+    if (now - last_budget_reset >= BUDGET_RESET_MS) {
+
+        last_budget_reset = now;
+
+        cum_co2 = 0.0f;
+        lambda = 0.30f;
+    }
+
+    // Manual override button
+    bool override_pressed =
+        (digitalRead(PIN_BTN_OVERR) == LOW);
+
+    if (override_pressed) {
+
+        utility_w[0] = 2.00f;
+        utility_w[1] = 0.05f;
+        utility_w[2] = 1.30f;
+
+    } else {
+
+        utility_w[0] = 1.50f;
+        utility_w[1] = 0.55f;
+        utility_w[2] = 0.70f;
+    }
+
+    int raw_pot = analogRead(PIN_POT_WATTS);
+
+    bool sw_fault =
+        (digitalRead(PIN_FAULT_SW) == HIGH);
+
+    int ood_flag =
+        (serial_fault_force || sw_fault) ? 1 : 0;
+
+    int hour_idx = (sim_tick / 8) % 24;
+
+    float grid_co2 = grid_24h[hour_idx];
+    float grid_norm = grid_co2 / 440.0f;
+
+    float base_watts =
+        25.0f + (raw_pot / 4095.0f) * 145.0f;
+
+    float watts_norm = base_watts / 170.0f;
+
+    float budget_ratio =
+        cum_co2 / carbon_budget_max;
+
+    float x[4] = {
+        watts_norm,
+        grid_norm,
+        constrain(budget_ratio, 0.0f, 1.5f),
+        override_pressed ? 1.0f : 0.0f
+    };
+
+    float w_delta = 0.0f;
+
+    if (!ood_flag) {
+
+        float budget_error =
+            (cum_co2 - 0.10f * carbon_budget_max) /
+            carbon_budget_max;
+
+        float target_lambda = constrain(
+            0.35f +
+            1.15f * (watts_norm * watts_norm) +
+            fmaxf(0.0f, budget_error),
+            0.25f,
+            1.60f
+        );
+
+        lambda += 0.25f * (target_lambda - lambda);
+
+        int steps = override_pressed ? 10 : 8;
+
+        float lr = override_pressed ? 0.07f : 0.055f;
+
+        for (int s = 0; s < steps; s++) {
+
+            w_delta += lagrangian_backprop(
+                x,
+                watts_norm,
+                grid_norm,
+                override_pressed,
+                lr
+            );
+        }
+
+        forward(x);
+
+        if (w_delta < 0.001f) {
+            w_delta += 0.0125f * lr;
+        }
+
+        float shed_from_red =
+            fmaxf(0.0f, 0.75f - y_hat[1]);
+
+        y_hat[0] = constrain(
+            y_hat[0] + 0.40f * shed_from_red,
+            0.80f,
+            1.0f
+        );
+
+        // Relay hysteresis
+        if (relay_nes_on && y_hat[1] < 0.45f) {
+            relay_nes_on = false;
+        } else if (!relay_nes_on && y_hat[1] > 0.55f) {
+            relay_nes_on = true;
+        }
+
+        digitalWrite(
+            PIN_RELAY_SHED,
+            relay_nes_on ? RELAY_NC_LED_ON : RELAY_NC_LED_OFF
+        );
+
+    } else {
+
+        forward(x);
+
+        float shed_from_red =
+            fmaxf(0.0f, 0.75f - y_hat[1]);
+
+        y_hat[0] = constrain(
+            y_hat[0] + 0.40f * shed_from_red,
+            0.80f,
+            1.0f
+        );
+    }
+
+    for (int i = 0; i < 3; i++) {
+        y_prev[i] = y_hat[i];
+    }
+
+    float nes_active_ratio =
+        relay_nes_on ? y_hat[1] : 0.0f;
+
+    float actual_watts = base_watts * (
+        ch_share[0] +
+        (nes_active_ratio * ch_share[1]) +
+        (y_hat[2] * ch_share[2])
+    );
+
+    float baseline_co2 =
+        (base_watts / 1000.0f) * grid_co2 * 0.25f;
+
+    float emitted_co2 =
+        (actual_watts / 1000.0f) * grid_co2 * 0.25f;
+
+    cum_co2 += emitted_co2;
+
+    saved_co2 += fmaxf(
+        0.0f,
+        baseline_co2 - emitted_co2
+    );
+
+    update_lcd(ood_flag);
+
+    // Publish MQTT telemetry every second
+    lastWeightDelta = w_delta;
+
+    if (mqtt.connected() &&
+        now - lastMqttPublish >= 1000UL) {
+
+        lastMqttPublish = now;
+
+        publishMqttStatus(
+            actual_watts,
+            grid_co2,
+            ood_flag,
+            override_pressed
+        );
+    }
+
+    // Serial output
+    Serial.print(cum_co2, 2);
+    Serial.print(",");
+
+    Serial.print(saved_co2, 2);
+    Serial.print(",");
+
+    Serial.print(carbon_budget_max, 2);
+    Serial.print(",");
+
+    Serial.print(lambda, 3);
+    Serial.print(",");
+
+    Serial.print(w_delta, 4);
+    Serial.print(",");
+
+    Serial.print(y_hat[0], 3);
+    Serial.print(",");
+
+    Serial.print(y_hat[1], 3);
+    Serial.print(",");
+
+    Serial.print(y_hat[2], 3);
+    Serial.print(",");
+
+    Serial.println(ood_flag);
+
+    sim_tick = (sim_tick + 1) % 192;
+}
